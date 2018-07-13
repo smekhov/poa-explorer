@@ -41,6 +41,11 @@ defmodule Explorer.Chain do
   """
   @type association :: atom()
 
+  @typedoc """
+  Event type where data is broadcasted whenever data is inserted from chain indexing.
+  """
+  @type chain_event :: :blocks | :logs
+
   @type direction :: :from | :to
 
   @typedoc """
@@ -1195,8 +1200,10 @@ defmodule Explorer.Chain do
     ecto_schema_module_to_params_list = import_options_to_ecto_schema_module_to_params_list(options)
 
     with {:ok, ecto_schema_module_to_changes_list} <-
-           ecto_schema_module_to_params_list_to_ecto_schema_module_to_changes_list(ecto_schema_module_to_params_list) do
-      insert_ecto_schema_module_to_changes_list(ecto_schema_module_to_changes_list, options)
+           ecto_schema_module_to_params_list_to_ecto_schema_module_to_changes_list(ecto_schema_module_to_params_list),
+         {:ok, data} <- insert_ecto_schema_module_to_changes_list(ecto_schema_module_to_changes_list, options) do
+      broadcast_events(data)
+      {:ok, data}
     end
   end
 
@@ -2057,6 +2064,34 @@ defmodule Explorer.Chain do
   end
 
   @doc """
+  Subscribes the caller process to a specified subset of chain-related events.
+
+  ## Handling An Event
+
+  A subscribed process should handle an event message. The message is in the
+  format of a three-element tuple.
+
+  * Element 0 - `:chain_event`
+  * Element 1 - event subscribed to
+  * Element 2 - event data in list form
+
+  # A new block event in a GenServer
+  def handle_info({:chain_event, :blocks, blocks}, state) do
+  # Do something with the blocks
+  end
+
+  ## Example
+
+  iex> Explorer.Chain.subscribe_to_events(:blocks)
+  :ok
+  """
+  @spec subscribe_to_events(chain_event()) :: :ok
+  def subscribe_to_events(event_type) when event_type in ~w(blocks logs)a do
+    Registry.register(Registry.ChainEvents, event_type, [])
+    :ok
+  end
+
+  @doc """
   Estimated count of `t:Explorer.Chain.Transaction.t/0`.
 
   Estimated count of both collated and pending transactions using the transactions table statistics.
@@ -2188,6 +2223,20 @@ defmodule Explorer.Chain do
     %SmartContract{}
     |> SmartContract.changeset(attrs)
     |> Repo.insert()
+  end
+
+  defp broadcast_event_data(event_type, event_data) do
+    Registry.dispatch(Registry.ChainEvents, event_type, fn entries ->
+      for {pid, _registered_val} <- entries do
+        send(pid, {:chain_event, event_type, event_data})
+      end
+    end)
+  end
+
+  defp broadcast_events(data) do
+    for {event_type, event_data} <- data, event_type in ~w(blocks logs)a do
+      broadcast_event_data(event_type, event_data)
+    end
   end
 
   @spec changes_list(params :: [map], [{:for, module} | {:with, atom}]) :: {:ok, [map]} | {:error, [Changeset.t()]}
@@ -2360,7 +2409,7 @@ defmodule Explorer.Chain do
     end)
   end
 
-  @spec insert_blocks([map()], [timeout_option | timestamps_option]) :: {:ok, [Hash.t()]} | {:error, [Changeset.t()]}
+  @spec insert_blocks([map()], [timeout_option | timestamps_option]) :: {:ok, [Block.t()]} | {:error, [Changeset.t()]}
   defp insert_blocks(changes_list, named_arguments)
        when is_list(changes_list) and is_list(named_arguments) do
     timestamps = Keyword.fetch!(named_arguments, :timestamps)
@@ -2369,17 +2418,18 @@ defmodule Explorer.Chain do
     # order so that row ShareLocks are grabbed in a consistent order
     ordered_changes_list = Enum.sort_by(changes_list, &{&1.number, &1.hash})
 
-    {:ok, _} =
+    {:ok, blocks} =
       insert_changes_list(
         ordered_changes_list,
         conflict_target: :number,
         on_conflict: :replace_all,
         for: Block,
+        returning: true,
         timeout: timeout,
         timestamps: timestamps
       )
 
-    {:ok, for(changes <- ordered_changes_list, do: changes.hash)}
+    {:ok, blocks}
   end
 
   defp insert_ecto_schema_module_to_changes_list(ecto_schema_module_to_changes_list, options) do
@@ -2422,7 +2472,7 @@ defmodule Explorer.Chain do
   end
 
   @spec insert_logs([map()], [timeout_option | timestamps_option]) ::
-          {:ok, [%{index: non_neg_integer, transaction_hash: Hash.t()}]}
+          {:ok, [Log.t()]}
           | {:error, [Changeset.t()]}
   defp insert_logs(changes_list, named_arguments)
        when is_list(changes_list) and is_list(named_arguments) do
@@ -2438,12 +2488,12 @@ defmodule Explorer.Chain do
         conflict_target: [:transaction_hash, :index],
         on_conflict: :replace_all,
         for: Log,
-        returning: [:index, :transaction_hash],
+        returning: true,
         timeout: timeout,
         timestamps: timestamps
       )
 
-    {:ok, for(log <- logs, do: Map.take(log, [:index, :transaction_hash]))}
+    {:ok, logs}
   end
 
   defp insert_changes_list(changes_list, options) when is_list(changes_list) do
